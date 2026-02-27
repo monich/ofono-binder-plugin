@@ -1426,6 +1426,7 @@ binder_plugin_slot_check_radio_client(
         if (modem_interface == RADIO_MODEM_INTERFACE) {
             // AIDL, need to connect to the other interfaces as well
             binder_plugin_connect_to_interface(slot, dev, RADIO_DATA_INTERFACE);
+            binder_plugin_connect_to_interface(slot, dev, RADIO_IMS_INTERFACE);
             binder_plugin_connect_to_interface(slot, dev, RADIO_MESSAGING_INTERFACE);
             binder_plugin_connect_to_interface(slot, dev, RADIO_NETWORK_INTERFACE);
             binder_plugin_connect_to_interface(slot, dev, RADIO_SIM_INTERFACE);
