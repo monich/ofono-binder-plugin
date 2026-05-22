@@ -1,6 +1,7 @@
 /*
  *  oFono - Open Source Telephony - binder based adaptation
  *
+ *  Copyright (C) 2026 Jolla Mobile Ltd
  *  Copyright (C) 2021-2022 Jolla Ltd.
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -20,7 +21,6 @@
 
 #include <radio_client.h>
 #include <radio_request.h>
-#include <radio_request_group.h>
 #include <radio_modem_types.h>
 
 #include <gbinder_reader.h>
@@ -29,23 +29,23 @@
 #include <gutil_macros.h>
 #include <gutil_misc.h>
 
-/*
- * Object states:
- *
- * 1. Idle (!pending && !retry)
- * 2. Power on/off request pending (pending)
- * 3. Power on retry has been scheduled (retry)
- */
+typedef struct binder_radio_api {
+    const char* name;
+    RADIO_IND radio_state_change_ind;
+    RADIO_REQ set_radio_power_req;
+    RADIO_RESP set_radio_power_resp;
+    void (*prepare_set_radio_power_req)(GBinderWriter* writer, gboolean on);
+} BinderRadioApi;
+
 typedef struct binder_radio_object {
     BinderBase base;
     BinderRadio pub;
     RadioClient* client;
-    RadioRequestGroup* g;
+    const BinderRadioApi* api;
     gulong state_event_id;
     char* log_prefix;
     GHashTable* req_table;
     RadioRequest* pending_req;
-    guint retry_id;
     guint state_changed_while_request_pending;
     RADIO_STATE last_known_state;
     gboolean power_cycle;
@@ -53,7 +53,7 @@ typedef struct binder_radio_object {
     gboolean next_state;
 } BinderRadioObject;
 
-#define POWER_RETRY_SECS (1)
+#define POWER_RETRY_MS (1000)
 
 typedef BinderBaseClass BinderRadioObjectClass;
 GType binder_radio_object_get_type() BINDER_INTERNAL;
@@ -72,6 +72,69 @@ void
 binder_radio_submit_power_request(
     BinderRadioObject* self,
     gboolean on);
+
+/*==========================================================================*
+ * Binder API flavors
+ *==========================================================================*/
+
+/*
+ * HIDL:
+ * setRadioPower(int32 serial, bool on)
+ * setRadioPower_1_5(int32 serial, bool on, bool forEmergencyCall,
+ *     bool preferredForEmergencyCall)
+ *
+ * AIDL:
+ * setRadioPower(int32 serial, bool on, bool forEmergencyCall,
+ *     bool preferredForEmergencyCall)
+ */
+static
+void
+binder_radio_prepare_set_power_req_hidl(
+   GBinderWriter* writer,
+   gboolean on)
+{
+    gbinder_writer_append_bool(writer, on);
+}
+
+static
+void
+binder_radio_prepare_set_power_req_aidl(
+   GBinderWriter* writer,
+   gboolean on)
+{
+    gbinder_writer_append_bool(writer, on);
+    gbinder_writer_append_bool(writer, FALSE); /* forEmergencyCall */
+    gbinder_writer_append_bool(writer, FALSE); /* preferredForEmergencyCall */
+}
+
+#define binder_radio_prepare_set_power_req_hidl_1_5 \
+    binder_radio_prepare_set_power_req_aidl
+
+static const BinderRadioApi binder_radio_api_hidl = {
+    "hidl",
+    RADIO_IND_RADIO_STATE_CHANGED,
+    RADIO_REQ_SET_RADIO_POWER,
+    RADIO_RESP_SET_RADIO_POWER,
+    binder_radio_prepare_set_power_req_hidl
+};
+static const BinderRadioApi binder_radio_api_hidl_1_5 = {
+    "hidl_1_5",
+    RADIO_IND_RADIO_STATE_CHANGED,
+    RADIO_REQ_SET_RADIO_POWER_1_5,
+    RADIO_RESP_SET_RADIO_POWER_1_5,
+    binder_radio_prepare_set_power_req_hidl_1_5
+};
+static const BinderRadioApi binder_radio_api_aidl = {
+    "aidl",
+    RADIO_MODEM_IND_RADIO_STATE_CHANGED,
+    RADIO_MODEM_REQ_SET_RADIO_POWER,
+    RADIO_MODEM_RESP_SET_RADIO_POWER,
+    binder_radio_prepare_set_power_req_aidl
+};
+
+/*==========================================================================*
+ * Implementation
+ *==========================================================================*/
 
 static inline BinderRadioObject* binder_radio_object_cast(BinderRadio* net)
     { return net ? THIS(G_CAST(net, BinderRadioObject, pub)) : NULL; }
@@ -96,34 +159,6 @@ binder_radio_power_should_be_on(
 }
 
 static
-gboolean
-binder_radio_power_request_retry_cb(
-    gpointer user_data)
-{
-    BinderRadioObject* self = THIS(user_data);
-
-    DBG_(self, "");
-    GASSERT(self->retry_id);
-    self->retry_id = 0;
-    binder_radio_submit_power_request(self,
-        binder_radio_power_should_be_on(self));
-
-    return G_SOURCE_REMOVE;
-}
-
-static
-void
-binder_radio_cancel_retry(
-    BinderRadioObject* self)
-{
-    if (self->retry_id) {
-        DBG_(self, "retry cancelled");
-        g_source_remove(self->retry_id);
-        self->retry_id = 0;
-    }
-}
-
-static
 void
 binder_radio_check_state(
     BinderRadioObject* self)
@@ -133,23 +168,15 @@ binder_radio_check_state(
     if (!self->pending_req) {
         const gboolean should_be_on = binder_radio_power_should_be_on(self);
 
-        if (binder_radio_state_on(self->last_known_state) == should_be_on) {
-            /* All is good, cancel pending retry if there is one */
-            binder_radio_cancel_retry(self);
-        } else if (self->state_changed_while_request_pending) {
+        if (binder_radio_state_on(self->last_known_state) != should_be_on &&
+            self->state_changed_while_request_pending) {
             /* Hmm... BINDER's reaction was inadequate, repeat */
             binder_radio_submit_power_request(self, should_be_on);
-        } else if (!self->retry_id) {
-            /* There has been no reaction so far, wait a bit */
-            DBG_(self, "retry scheduled");
-            self->retry_id = g_timeout_add_seconds(POWER_RETRY_SECS,
-                binder_radio_power_request_retry_cb, self);
         }
     }
 
     /* Don't update public state while something is pending */
-    if (!self->pending_req && !self->retry_id &&
-        radio->state != self->last_known_state) {
+    if (!self->pending_req && radio->state != self->last_known_state) {
         DBG_(self, "%s -> %s", binder_radio_state_string(radio->state),
              binder_radio_state_string(self->last_known_state));
         radio->state = self->last_known_state;
@@ -182,24 +209,13 @@ binder_radio_power_request_cb(
     void* user_data)
 {
     BinderRadioObject* self = THIS(user_data);
-    const RADIO_INTERFACE iface = radio_client_interface(self->client);
-    const RADIO_AIDL_INTERFACE iface_aidl = radio_client_aidl_interface(self->client);
-    guint32 code = RADIO_RESP_NONE;
-
-    if (iface_aidl == RADIO_AIDL_INTERFACE_NONE) {
-        code = (iface >= RADIO_INTERFACE_1_5) ?
-               RADIO_RESP_SET_RADIO_POWER_1_5 :
-               RADIO_RESP_SET_RADIO_POWER;
-    } else if (iface_aidl == RADIO_MODEM_INTERFACE) {
-        code = RADIO_MODEM_RESP_SET_RADIO_POWER;
-    }
 
     GASSERT(self->pending_req == req);
     radio_request_unref(self->pending_req);
     self->pending_req = NULL;
 
     if (status == RADIO_TX_STATUS_OK) {
-        if (resp != code) {
+        if (resp != self->api->set_radio_power_resp) {
             ofono_error("Unexpected setRadioPower response %d", resp);
         } else if (error != RADIO_ERROR_NONE) {
             ofono_error("Power request failed: %s",
@@ -213,54 +229,42 @@ binder_radio_power_request_cb(
 }
 
 static
+gboolean
+binder_radio_retry_power_request(
+    RadioRequest* req,
+    RADIO_TX_STATUS status,
+    RADIO_RESP resp,
+    RADIO_ERROR error,
+    const GBinderReader* reader,
+    void* user_data)
+{
+    return status != RADIO_TX_STATUS_OK ||
+        (error != RADIO_ERROR_NONE &&
+         error != RADIO_ERROR_OPERATION_NOT_ALLOWED);
+}
+
+static
 void
 binder_radio_submit_power_request(
     BinderRadioObject* self,
     gboolean on)
 {
-    /* setRadioPower(int32 serial, bool on)
-     * setRadioPower_1_5(int32 serial, bool on, bool forEmergencyCall,
-     *     bool preferredForEmergencyCall)
-     * AIDL:
-     * setRadioPower(int32 serial, bool on, bool forEmergencyCall,
-     *     bool preferredForEmergencyCall)
-     */
+    const BinderRadioApi* api = self->api;
     GBinderWriter writer;
-    const RADIO_INTERFACE iface = radio_client_interface(self->client);
-    const RADIO_AIDL_INTERFACE iface_aidl = radio_client_aidl_interface(self->client);
-    guint32 code = RADIO_REQ_NONE;
-
-    if (iface_aidl == RADIO_AIDL_INTERFACE_NONE) {
-        code = (iface >= RADIO_INTERFACE_1_5) ?
-               RADIO_REQ_SET_RADIO_POWER_1_5 :
-               RADIO_REQ_SET_RADIO_POWER;
-    } else if (iface_aidl == RADIO_MODEM_INTERFACE) {
-        code = RADIO_MODEM_REQ_SET_RADIO_POWER;
-    }
-
     RadioRequest* req = radio_request_new(self->client,
-        code, &writer,
+        api->set_radio_power_req, &writer,
         binder_radio_power_request_cb, NULL, self);
 
-    gbinder_writer_append_bool(&writer, on);
-    if ((iface_aidl == RADIO_AIDL_INTERFACE_NONE && iface >= RADIO_INTERFACE_1_5) ||
-            iface_aidl == RADIO_MODEM_INTERFACE) {
-        gbinder_writer_append_bool(&writer, FALSE);
-        gbinder_writer_append_bool(&writer, FALSE);
-    }
-
+    GASSERT(!self->pending_req);
     self->next_state_valid = FALSE;
     self->next_state = on;
     self->state_changed_while_request_pending = 0;
-    binder_radio_cancel_retry(self);
 
-    GASSERT(!self->pending_req);
+    api->prepare_set_radio_power_req(&writer, on);
+    radio_request_set_retry(req, POWER_RETRY_MS, -1);
+    radio_request_set_retry_func(req, binder_radio_retry_power_request);
     radio_request_set_blocking(req, TRUE);
-    if (radio_request_submit(req)) {
-        self->pending_req = req; /* Keep the ref */
-    } else {
-        radio_request_unref(req);
-    }
+    self->pending_req = radio_request_try_submit(req);
 }
 
 static
@@ -306,46 +310,44 @@ binder_radio_state_changed(
     gint32 tmp;
 
     /* radioStateChanged(RadioIndicationType, RadioState radioState); */
-   gbinder_reader_copy(&reader, args);
-   if (gbinder_reader_read_int32(&reader, &tmp)) {
-       radio_state = tmp;
-   } else {
-       ofono_error("Failed to parse radioStateChanged payload");
-   }
+    gbinder_reader_copy(&reader, args);
+    if (gbinder_reader_read_int32(&reader, &tmp)) {
+        radio_state = tmp;
+    } else {
+        ofono_error("Failed to parse radioStateChanged payload");
+    }
 
-   if (radio_state != RADIO_STATE_UNAVAILABLE) {
-       DBG_(self, "%s", binder_radio_state_string(radio_state));
+    if (radio_state != RADIO_STATE_UNAVAILABLE) {
+        DBG_(self, "%s", binder_radio_state_string(radio_state));
+        if (self->power_cycle && binder_radio_state_off(radio_state)) {
+            DBG_(self, "switched off for power cycle");
+            self->power_cycle = FALSE;
+        }
 
-       GASSERT(!self->pending_req || !self->retry_id);
-       if (self->power_cycle && binder_radio_state_off(radio_state)) {
-           DBG_(self, "switched off for power cycle");
-           self->power_cycle = FALSE;
-       }
+        self->last_known_state = radio_state;
 
-       self->last_known_state = radio_state;
+        if (self->pending_req) {
+            if (binder_radio_state_on(radio_state) ==
+                binder_radio_power_should_be_on(self)) {
+                DBG_(self, "dropping pending request");
+                /*
+                 * All right, the modem has switched to the
+                 * desired state, drop the request.
+                 */
+                radio_request_drop(self->pending_req);
+                self->pending_req = NULL;
+                binder_radio_power_request_done(self);
 
-       if (self->pending_req) {
-           if (binder_radio_state_on(radio_state) ==
-               binder_radio_power_should_be_on(self)) {
-               DBG_(self, "dropping pending request");
-               /*
-                * All right, the modem has switched to the
-                * desired state, drop the request.
-                */
-               radio_request_drop(self->pending_req);
-               self->pending_req = NULL;
-               binder_radio_power_request_done(self);
+                /* We are done */
+                return;
+            } else {
+                /* Something weird is going on */
+                self->state_changed_while_request_pending++;
+            }
+        }
 
-               /* We are done */
-               return;
-           } else {
-               /* Something weird is going on */
-               self->state_changed_while_request_pending++;
-           }
-       }
-
-       binder_radio_check_state(self);
-   }
+        binder_radio_check_state(self);
+    }
 }
 
 /*==========================================================================*
@@ -358,28 +360,26 @@ binder_radio_new(
     const char* log_prefix)
 {
     BinderRadioObject* self = g_object_new(THIS_TYPE, NULL);
-    BinderRadio* radio = &self->pub;
-    const RADIO_AIDL_INTERFACE iface_aidl = radio_client_aidl_interface(client);
+    const RADIO_INTERFACE hidl = radio_client_interface(client);
+    const RADIO_AIDL_INTERFACE aidl = radio_client_aidl_interface(client);
+    const BinderRadioApi* api =
+        (aidl == RADIO_MODEM_INTERFACE) ? &binder_radio_api_aidl :
+        (hidl >= RADIO_INTERFACE_1_5) ? &binder_radio_api_hidl_1_5 :
+        &binder_radio_api_hidl;
 
     self->client = radio_client_ref(client);
-    self->g = radio_request_group_new(client);
     self->log_prefix = binder_dup_prefix(log_prefix);
-    DBG_(self, "");
-
-    if (iface_aidl == RADIO_AIDL_INTERFACE_NONE) {
-        self->state_event_id = radio_client_add_indication_handler(client,
-            RADIO_IND_RADIO_STATE_CHANGED, binder_radio_state_changed, self);
-    } else if (iface_aidl == RADIO_MODEM_INTERFACE) {
-        self->state_event_id = radio_client_add_indication_handler(client,
-            RADIO_MODEM_IND_RADIO_STATE_CHANGED, binder_radio_state_changed, self);
-    }
-
+    self->api = api;
+    DBG_(self, "%s api", api->name);
+        
+    self->state_event_id = radio_client_add_indication_handler(client,
+        api->radio_state_change_ind, binder_radio_state_changed, self);
     /*
      * Some modem adaptations like to receive power off request at startup
      * even if radio is already off. Make those happy.
      */
     binder_radio_submit_power_request(self, FALSE);
-    return radio;
+    return &self->pub;
 }
 
 BinderRadio*
@@ -564,11 +564,7 @@ binder_radio_object_finalize(
     BinderRadioObject* self = THIS(object);
 
     DBG_(self, "");
-    binder_radio_cancel_retry(self);
-
     radio_request_drop(self->pending_req);
-    radio_request_group_cancel(self->g);
-    radio_request_group_unref(self->g);
     radio_client_remove_handler(self->client, self->state_event_id);
     radio_client_unref(self->client);
 

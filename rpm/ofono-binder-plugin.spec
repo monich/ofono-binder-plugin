@@ -9,7 +9,7 @@ Source: %{name}-%{version}.tar.bz2
 
 %define libglibutil_version 1.0.61
 %define libgbinder_version 1.1.29
-%define libgbinder_radio_version 1.6.0
+%define libgbinder_radio_version 1.6.2
 %define libmce_version 1.0.6
 %define libofonobinderpluginext_version 1.1.22
 %define glib_version 2.32
